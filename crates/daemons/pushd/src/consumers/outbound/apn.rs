@@ -31,11 +31,11 @@ struct MessagePayload<'a> {
 
     message: &'a Message,
     url: &'a str,
-    #[serde(rename = "camelCase")]
+    #[serde(rename = "authorAvatar")]
     author_avatar: &'a str,
-    #[serde(rename = "camelCase")]
+    #[serde(rename = "authorDisplayName")]
     author_display_name: &'a str,
-    #[serde(rename = "camelCase")]
+    #[serde(rename = "channelName")]
     channel_name: &'a str,
 }
 
@@ -72,6 +72,54 @@ impl<'a> PayloadLike for CallStartStopPayload<'a> {
     fn get_options(&self) -> &NotificationOptions<'a> {
         &self.options
     }
+}
+
+// region: helpers
+
+/// APNs payload limit
+const MAX_APNS_PAYLOAD_BYTES: usize = 4096;
+
+/// Max size of the body we show in the notification
+const MAX_BODY_BYTES: usize = 1024;
+
+/// Cut a string down to `max` bytes without splitting a character
+fn truncate_utf8(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    format!("{}…", &text[..end])
+}
+
+/// Trim the message until the payload fits, `overhead` being everything except the message.
+/// Anything that already fits is left alone.
+fn shrink_message_to_fit(message: &mut Message, overhead: usize) {
+    let fits = |message: &Message| {
+        overhead + serde_json::to_vec(message).map_or(0, |json| json.len())
+            <= MAX_APNS_PAYLOAD_BYTES
+    };
+
+    if fits(message) {
+        return;
+    }
+
+    message.embeds = None;
+    message.user = None;
+    message.member = None;
+    if fits(message) {
+        return;
+    }
+
+    message.content = message
+        .content
+        .as_deref()
+        .map(|content| truncate_utf8(content, 256));
+    message.attachments = None;
 }
 
 // region: consumer
@@ -303,12 +351,16 @@ impl Consumer for ApnsOutboundConsumer {
 
             PayloadKind::MessageNotification(alert) => {
                 let title = self.format_title(&alert);
-                let apn_payload = MessagePayload {
+                let body = truncate_utf8(&alert.body, MAX_BODY_BYTES);
+                let badge = self.get_badge_count(&payload.user_id).await;
+                let channel_name = alert.channel.name().unwrap_or(&title);
+
+                let build_payload = |message| MessagePayload {
                     aps: APS {
                         alert: Some(APSAlert::Default(DefaultAlert {
                             title: Some(&title),
                             subtitle: None,
-                            body: Some(&alert.body),
+                            body: Some(&body),
                             title_loc_key: None,
                             title_loc_args: None,
                             action_loc_key: None,
@@ -316,7 +368,7 @@ impl Consumer for ApnsOutboundConsumer {
                             loc_args: None,
                             launch_image: None,
                         })),
-                        badge: self.get_badge_count(&payload.user_id).await,
+                        badge,
                         sound: Some(APSSound::Sound("default")),
                         thread_id: Some(alert.channel.id()),
                         content_available: None,
@@ -326,12 +378,20 @@ impl Consumer for ApnsOutboundConsumer {
                     },
                     device_token: &payload.token,
                     options: payload_options.clone(),
-                    message: &alert.message,
+                    message,
                     url: &alert.url,
                     author_avatar: &alert.icon,
                     author_display_name: &alert.author,
-                    channel_name: alert.channel.name().unwrap_or(&title),
+                    channel_name,
                 };
+
+                let full_size = serde_json::to_vec(&build_payload(&alert.message))?.len();
+                let message_size = serde_json::to_vec(&alert.message)?.len();
+
+                let mut message = alert.message.clone();
+                shrink_message_to_fit(&mut message, full_size.saturating_sub(message_size));
+
+                let apn_payload = build_payload(&message);
 
                 debug!(
                     "Sending message notification for user: {:}",
