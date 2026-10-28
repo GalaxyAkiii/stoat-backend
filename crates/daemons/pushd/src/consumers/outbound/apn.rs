@@ -57,11 +57,10 @@ struct CallStartStopPayload<'a> {
     device_token: &'a str,
 
     initiator_id: &'a str,
-    #[serde(rename = "camelCase")]
+    #[serde(rename = "channelId")]
     channel_id: &'a str,
-    #[serde(rename = "camelCase")]
+    #[serde(rename = "startedAt")]
     started_at: &'a str,
-    #[serde(rename = "camelCase")]
     ended: bool,
 }
 
