@@ -474,3 +474,105 @@ impl Consumer for ApnsOutboundConsumer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Pretend the rest of the payload (aps, urls, etc) takes up this much room
+    const OVERHEAD: usize = 600;
+
+    fn message(content_len: usize, embed_len: usize) -> Message {
+        serde_json::from_value(json!({
+            "_id": "01HZ0000000000000000000000",
+            "channel": "01HZ0000000000000000000001",
+            "author": "01HZ0000000000000000000002",
+            "content": "a".repeat(content_len),
+            "user": {
+                "_id": "01HZ0000000000000000000002",
+                "username": "someone",
+                "discriminator": "0001",
+                "relations": [],
+                "badges": 0,
+                "flags": 0,
+                "privileged": false,
+                "relationship": "None",
+                "online": false
+            },
+            "member": {
+                "_id": { "server": "01HZ0000000000000000000003", "user": "01HZ0000000000000000000002" },
+                "joined_at": "2020-01-01T00:00:00.000Z"
+            },
+            "attachments": [{
+                "_id": "01HZ0000000000000000000004",
+                "tag": "attachments",
+                "filename": "file.png",
+                "metadata": { "type": "File" },
+                "content_type": "image/png",
+                "size": 10
+            }],
+            "embeds": [{ "type": "Text", "description": "b".repeat(embed_len) }]
+        }))
+        .unwrap()
+    }
+
+    fn size(message: &Message) -> usize {
+        OVERHEAD + serde_json::to_vec(message).unwrap().len()
+    }
+
+    #[test]
+    fn leaves_small_messages_alone() {
+        let mut shrunk = message(100, 100);
+        let before = serde_json::to_value(&shrunk).unwrap();
+
+        shrink_message_to_fit(&mut shrunk, OVERHEAD);
+
+        assert_eq!(serde_json::to_value(&shrunk).unwrap(), before);
+    }
+
+    #[test]
+    fn drops_embeds_user_and_member_before_touching_text() {
+        let mut shrunk = message(100, 5000);
+        assert!(size(&shrunk) > MAX_APNS_PAYLOAD_BYTES);
+
+        shrink_message_to_fit(&mut shrunk, OVERHEAD);
+
+        assert!(shrunk.embeds.is_none());
+        assert!(shrunk.user.is_none());
+        assert!(shrunk.member.is_none());
+        // text and attachments are only dropped if that wasn't enough
+        assert_eq!(shrunk.content.as_deref().map(str::len), Some(100));
+        assert!(shrunk.attachments.is_some());
+        assert!(size(&shrunk) <= MAX_APNS_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn truncates_text_and_drops_attachments_last() {
+        let mut shrunk = message(5000, 5000);
+        assert!(size(&shrunk) > MAX_APNS_PAYLOAD_BYTES);
+
+        shrink_message_to_fit(&mut shrunk, OVERHEAD);
+
+        assert!(shrunk.embeds.is_none());
+        assert!(shrunk.user.is_none());
+        assert!(shrunk.member.is_none());
+        assert!(shrunk.attachments.is_none());
+
+        let content = shrunk.content.as_deref().unwrap();
+        assert!(content.ends_with('…'));
+        // 256 bytes plus the 3 byte ellipsis
+        assert_eq!(content.len(), 256 + '…'.len_utf8());
+        assert!(size(&shrunk) <= MAX_APNS_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn truncating_never_splits_a_character() {
+        // each é is two bytes, so cutting at an odd length lands mid character
+        let text = "é".repeat(10);
+        let cut = truncate_utf8(&text, 5);
+
+        assert_eq!(cut, "éé…");
+        assert_eq!(truncate_utf8("short", 100), "short");
+    }
+}
