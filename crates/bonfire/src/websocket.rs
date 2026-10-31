@@ -439,9 +439,6 @@ async fn worker_with_kill_signal(
     kill_signal_s.send(()).await.ok();
 }
 
-/// Clients ping every 30s, so this lets a couple go missing before we give up
-const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-
 #[allow(clippy::too_many_arguments)]
 async fn worker(
     addr: SocketAddr,
@@ -458,17 +455,11 @@ async fn worker(
     loop {
         let t1 = read.try_next().fuse();
         let t2 = kill_signal_r.recv().fuse();
-        let t3 = tokio::time::sleep(IDLE_TIMEOUT).fuse();
 
-        pin_mut!(t1, t2, t3);
+        pin_mut!(t1, t2);
 
         select! {
             _ = t2 => {
-                return;
-            },
-            _ = t3 => {
-                // dead connections keep people "online", which blocks their push notifications
-                info!("Closing idle connection from {addr:?}");
                 return;
             },
             result = t1 => {

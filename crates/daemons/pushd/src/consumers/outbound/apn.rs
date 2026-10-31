@@ -29,7 +29,7 @@ struct MessagePayload<'a> {
     #[serde(skip_serializing)]
     device_token: &'a str,
 
-    message: &'a Message,
+    message: MessageData<'a>,
     url: &'a str,
     #[serde(rename = "authorAvatar")]
     author_avatar: &'a str,
@@ -37,6 +37,20 @@ struct MessagePayload<'a> {
     author_display_name: &'a str,
     #[serde(rename = "channelName")]
     channel_name: &'a str,
+}
+
+/// The message sent alongside a notification
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+enum MessageData<'a> {
+    Full(&'a Message),
+    /// Just enough for the client to fetch the message itself
+    Ids {
+        #[serde(rename = "_id")]
+        id: &'a str,
+        channel: &'a str,
+        author: &'a str,
+    },
 }
 
 impl<'a> PayloadLike for MessagePayload<'a> {
@@ -95,30 +109,21 @@ fn truncate_utf8(text: &str, max: usize) -> String {
     format!("{}…", &text[..end])
 }
 
-/// Trim the message until the payload fits, `overhead` being everything except the message.
-/// Anything that already fits is left alone.
-fn shrink_message_to_fit(message: &mut Message, overhead: usize) {
-    let fits = |message: &Message| {
-        overhead + serde_json::to_vec(message).map_or(0, |json| json.len())
-            <= MAX_APNS_PAYLOAD_BYTES
-    };
-
-    if fits(message) {
-        return;
+/// APNs rejects payloads over 4kb, so if the full message doesn't fit only send its ids
+/// and let the client fetch the rest. Serializes the payload once.
+fn fit_payload<'a>(
+    payload: &mut MessagePayload<'a>,
+    message: &'a Message,
+) -> serde_json::Result<()> {
+    if serde_json::to_vec(payload)?.len() > MAX_APNS_PAYLOAD_BYTES {
+        payload.message = MessageData::Ids {
+            id: &message.id,
+            channel: &message.channel,
+            author: &message.author,
+        };
     }
 
-    message.embeds = None;
-    message.user = None;
-    message.member = None;
-    if fits(message) {
-        return;
-    }
-
-    message.content = message
-        .content
-        .as_deref()
-        .map(|content| truncate_utf8(content, 256));
-    message.attachments = None;
+    Ok(())
 }
 
 // region: consumer
@@ -351,10 +356,7 @@ impl Consumer for ApnsOutboundConsumer {
             PayloadKind::MessageNotification(alert) => {
                 let title = self.format_title(&alert);
                 let body = truncate_utf8(&alert.body, MAX_BODY_BYTES);
-                let badge = self.get_badge_count(&payload.user_id).await;
-                let channel_name = alert.channel.name().unwrap_or(&title);
-
-                let build_payload = |message| MessagePayload {
+                let mut apn_payload = MessagePayload {
                     aps: APS {
                         alert: Some(APSAlert::Default(DefaultAlert {
                             title: Some(&title),
@@ -367,7 +369,7 @@ impl Consumer for ApnsOutboundConsumer {
                             loc_args: None,
                             launch_image: None,
                         })),
-                        badge,
+                        badge: self.get_badge_count(&payload.user_id).await,
                         sound: Some(APSSound::Sound("default")),
                         thread_id: Some(alert.channel.id()),
                         content_available: None,
@@ -377,20 +379,14 @@ impl Consumer for ApnsOutboundConsumer {
                     },
                     device_token: &payload.token,
                     options: payload_options.clone(),
-                    message,
+                    message: MessageData::Full(&alert.message),
                     url: &alert.url,
                     author_avatar: &alert.icon,
                     author_display_name: &alert.author,
-                    channel_name,
+                    channel_name: alert.channel.name().unwrap_or(&title),
                 };
 
-                let full_size = serde_json::to_vec(&build_payload(&alert.message))?.len();
-                let message_size = serde_json::to_vec(&alert.message)?.len();
-
-                let mut message = alert.message.clone();
-                shrink_message_to_fit(&mut message, full_size.saturating_sub(message_size));
-
-                let apn_payload = build_payload(&message);
+                fit_payload(&mut apn_payload, &alert.message)?;
 
                 debug!(
                     "Sending message notification for user: {:}",
@@ -480,90 +476,59 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Pretend the rest of the payload (aps, urls, etc) takes up this much room
-    const OVERHEAD: usize = 600;
-
-    fn message(content_len: usize, embed_len: usize) -> Message {
+    fn message(content_len: usize) -> Message {
         serde_json::from_value(json!({
             "_id": "01HZ0000000000000000000000",
             "channel": "01HZ0000000000000000000001",
             "author": "01HZ0000000000000000000002",
             "content": "a".repeat(content_len),
-            "user": {
-                "_id": "01HZ0000000000000000000002",
-                "username": "someone",
-                "discriminator": "0001",
-                "relations": [],
-                "badges": 0,
-                "flags": 0,
-                "privileged": false,
-                "relationship": "None",
-                "online": false
-            },
-            "member": {
-                "_id": { "server": "01HZ0000000000000000000003", "user": "01HZ0000000000000000000002" },
-                "joined_at": "2020-01-01T00:00:00.000Z"
-            },
-            "attachments": [{
-                "_id": "01HZ0000000000000000000004",
-                "tag": "attachments",
-                "filename": "file.png",
-                "metadata": { "type": "File" },
-                "content_type": "image/png",
-                "size": 10
-            }],
-            "embeds": [{ "type": "Text", "description": "b".repeat(embed_len) }]
         }))
         .unwrap()
     }
 
-    fn size(message: &Message) -> usize {
-        OVERHEAD + serde_json::to_vec(message).unwrap().len()
+    fn payload(message: &Message) -> MessagePayload<'_> {
+        MessagePayload {
+            aps: APS::default(),
+            options: NotificationOptions::default(),
+            device_token: "token",
+            message: MessageData::Full(message),
+            url: "https://example.com",
+            author_avatar: "https://example.com/avatar.png",
+            author_display_name: "someone",
+            channel_name: "general",
+        }
     }
 
     #[test]
-    fn leaves_small_messages_alone() {
-        let mut shrunk = message(100, 100);
-        let before = serde_json::to_value(&shrunk).unwrap();
+    fn small_messages_are_sent_in_full() {
+        let message = message(100);
+        let mut payload = payload(&message);
 
-        shrink_message_to_fit(&mut shrunk, OVERHEAD);
+        fit_payload(&mut payload, &message).unwrap();
 
-        assert_eq!(serde_json::to_value(&shrunk).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(&payload).unwrap()["message"],
+            serde_json::to_value(&message).unwrap()
+        );
     }
 
     #[test]
-    fn drops_embeds_user_and_member_before_touching_text() {
-        let mut shrunk = message(100, 5000);
-        assert!(size(&shrunk) > MAX_APNS_PAYLOAD_BYTES);
+    fn oversized_messages_fall_back_to_ids() {
+        let message = message(5000);
+        let mut payload = payload(&message);
+        assert!(serde_json::to_vec(&payload).unwrap().len() > MAX_APNS_PAYLOAD_BYTES);
 
-        shrink_message_to_fit(&mut shrunk, OVERHEAD);
+        fit_payload(&mut payload, &message).unwrap();
 
-        assert!(shrunk.embeds.is_none());
-        assert!(shrunk.user.is_none());
-        assert!(shrunk.member.is_none());
-        // text and attachments are only dropped if that wasn't enough
-        assert_eq!(shrunk.content.as_deref().map(str::len), Some(100));
-        assert!(shrunk.attachments.is_some());
-        assert!(size(&shrunk) <= MAX_APNS_PAYLOAD_BYTES);
-    }
-
-    #[test]
-    fn truncates_text_and_drops_attachments_last() {
-        let mut shrunk = message(5000, 5000);
-        assert!(size(&shrunk) > MAX_APNS_PAYLOAD_BYTES);
-
-        shrink_message_to_fit(&mut shrunk, OVERHEAD);
-
-        assert!(shrunk.embeds.is_none());
-        assert!(shrunk.user.is_none());
-        assert!(shrunk.member.is_none());
-        assert!(shrunk.attachments.is_none());
-
-        let content = shrunk.content.as_deref().unwrap();
-        assert!(content.ends_with('…'));
-        // 256 bytes plus the 3 byte ellipsis
-        assert_eq!(content.len(), 256 + '…'.len_utf8());
-        assert!(size(&shrunk) <= MAX_APNS_PAYLOAD_BYTES);
+        assert_eq!(
+            serde_json::to_value(&payload).unwrap()["message"],
+            json!({
+                "_id": "01HZ0000000000000000000000",
+                "channel": "01HZ0000000000000000000001",
+                "author": "01HZ0000000000000000000002",
+            })
+        );
+        assert!(serde_json::to_vec(&payload).unwrap().len() <= MAX_APNS_PAYLOAD_BYTES);
     }
 
     #[test]

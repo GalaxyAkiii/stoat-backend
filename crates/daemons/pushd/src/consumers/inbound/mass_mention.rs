@@ -148,14 +148,8 @@ impl Consumer for MassMessageConsumer {
                             }
                         }
 
-                        // skip anyone who can't see the channel
-                        let mut q = query.clone().members(&chunk);
-                        let userids: Vec<String> = q
-                            .members_can_see_channel()
-                            .await
-                            .into_iter()
-                            .filter_map(|(uid, viewable)| viewable.then_some(uid))
-                            .collect();
+                        let userids: Vec<String> =
+                            chunk.iter().map(|member| member.id.user.clone()).collect();
 
                         debug!("Userids in chunk: {:?}", userids);
 

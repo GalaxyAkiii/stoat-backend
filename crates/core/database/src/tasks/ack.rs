@@ -238,26 +238,13 @@ pub async fn worker(db: Database, amqp: AMQP) {
         for key in &keys {
             if let Some(task) = tasks.remove(key) {
                 let Task { event } = task.data;
-                let (user, channel, _) = key.clone();
-                let (db, amqp) = (db.clone(), amqp.clone());
+                let (user, channel, _) = key;
 
-                // spawned so a panic only loses this event, not the whole worker
-                let result = tokio::spawn(async move {
-                    if let Err(err) = handle_ack_event(&event, &db, &amqp, &user, &channel).await {
-                        revolt_config::capture_error(&err);
-                        error!("{err:?} for {event:?}. ({user:?}, {channel})");
-                    } else {
-                        info!("User {user:?} ack in {channel} with {event:?}");
-                    }
-                })
-                .await;
-
-                if let Err(err) = result {
-                    capture_message(
-                        &format!("Ack task panicked: {err:?}"),
-                        revolt_config::Level::Error,
-                    );
-                    error!("Ack task panicked: {err:?}");
+                if let Err(err) = handle_ack_event(&event, &db, &amqp, user, channel).await {
+                    revolt_config::capture_error(&err);
+                    error!("{err:?} for {event:?}. ({user:?}, {channel})");
+                } else {
+                    info!("User {user:?} ack in {channel} with {event:?}");
                 }
             }
         }
